@@ -1,10 +1,19 @@
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
+use serde::de::{self, Visitor};
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::fs;
+use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+const PVP_DEFAULT_LEVEL: i32 = 60;
+const PVP_DEFAULT_INDIVIDUAL_VALUE: i32 = 0;
+const PVP_DEFAULT_MAGNIFICATION: f32 = 1.0;
+const PVP_EFFORT_BASE_MIN: i32 = 7;
+const PVP_EFFORT_BASE_MAX: i32 = 10;
+const PVP_EFFORT_MULTIPLIER: i32 = 4;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum AiBattleSetupMode {
@@ -31,20 +40,89 @@ struct AssistantMessage {
 struct PetJsonLite {
     name: String,
     element: String,
-    element2: String,
+    #[serde(default)]
+    element2: Option<String>,
+    #[serde(default, deserialize_with = "de_i32_or_default")]
     hp: i32,
+    #[serde(default, deserialize_with = "de_i32_or_default")]
     speed: i32,
-    #[serde(rename = "physicalAttack")]
+    #[serde(default, rename = "physicalAttack", deserialize_with = "de_i32_or_default")]
     physical_attack: i32,
-    #[serde(rename = "physicalDefense")]
+    #[serde(default, rename = "physicalDefense", deserialize_with = "de_i32_or_default")]
     physical_defense: i32,
-    #[serde(rename = "magicAttack")]
+    #[serde(default, rename = "magicAttack", deserialize_with = "de_i32_or_default")]
     magic_attack: i32,
-    #[serde(rename = "magicDefense")]
+    #[serde(default, rename = "magicDefense", deserialize_with = "de_i32_or_default")]
     magic_defense: i32,
     skills: Vec<String>,
     #[serde(default, rename = "skillDetails")]
     skill_details: Vec<SkillDetailLite>,
+}
+
+fn de_i32_or_default<'de, D>(deserializer: D) -> Result<i32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct I32OrDefaultVisitor;
+
+    impl<'de> Visitor<'de> for I32OrDefaultVisitor {
+        type Value = i32;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("an integer, numeric string, or null")
+        }
+
+        fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(value as i32)
+        }
+
+        fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(value as i32)
+        }
+
+        fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(value.round() as i32)
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(value.trim().parse::<i32>().unwrap_or(0))
+        }
+
+        fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            self.visit_str(&value)
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(0)
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(0)
+        }
+    }
+
+    deserializer.deserialize_any(I32OrDefaultVisitor)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -71,6 +149,7 @@ struct BattleSkill {
 #[derive(Clone)]
 struct BattlePet {
     name: String,
+    level: i32,
     nature: String,
     element1: String,
     element2: Option<String>,
@@ -92,7 +171,18 @@ struct BattlePet {
     has_entered_once: bool,
     entry_leave_immune: bool,
     morph_stage: u8,
+    effort: EffortValues,
     skills: Vec<BattleSkill>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct EffortValues {
+    hp: i32,
+    patk: i32,
+    matk: i32,
+    pdef: i32,
+    mdef: i32,
+    speed: i32,
 }
 
 #[derive(Clone)]
@@ -176,6 +266,7 @@ where
         .map_err(|e| format!("创建 HTTP 客户端失败: {}", e))?;
 
     on_delta("=== 对战开始（程序结算，AI仅决策）===\n");
+    on_delta(&format!("PVP等级已统一：所有精灵等级设为 {} 级。\n", PVP_DEFAULT_LEVEL));
     let mut a_active = 0usize;
     let mut b_active = 0usize;
     let mut history = String::new();
@@ -653,7 +744,7 @@ async fn llm_choose_action(
         .map(|s| format!("- {}|属性:{}|分类:{}|能耗:{}|威力:{}|{}", s.name, s.element, s.category, s.cost, s.power, s.effect))
         .collect::<Vec<_>>()
         .join("\n");
-    let tail = if history.len() > 1200 { &history[history.len() - 1200..] } else { history };
+    let tail = safe_tail_chars(history, 1200);
     let switchable = own_team
         .iter()
         .enumerate()
@@ -666,22 +757,28 @@ async fn llm_choose_action(
         switchable.join(", ")
     };
 
+    let enemy_hp_pct = if opp.hp > 0 {
+        ((opp.cur_hp as f32 / opp.hp as f32) * 100.0).round() as i32
+    } else {
+        0
+    };
+    let enemy_intel = observed_enemy_intel(side, history);
     let user = format!(
-        "你是{}方决策AI。\n规则摘要：每回合输出一个动作；程序负责结算。\n合法输出格式二选一：\n1) SKILL:技能名\n2) SWITCH:精灵名\n回合:{}\n我方:{}(性格:{}) HP {}/{} 能量 {} 速度 {}\n敌方:{}(性格:{}) HP {}/{} 能量 {} 速度 {}\n可用技能:\n{}\n可切换精灵:\n{}\n最近战报:\n{}\n仅输出一行动作。",
+        "你是{}方决策AI。\n规则摘要：每回合输出一个动作；程序负责结算。\n信息限制：你只能确定敌方当前精灵名、血量百分比、能量；无法直接得知敌方性格、努力值、速度、属性细节、未登场精灵。\n你可以利用历史战报中的已观测信息（敌方释放过的技能、敌方上场过的精灵）进行记忆与推断。\n合法输出格式二选一：\n1) SKILL:技能名\n2) SWITCH:精灵名\n回合:{}\n我方:{}(Lv{} 性格:{} 努力值:{}) HP {}/{} 能量 {} 速度 {}\n敌方:{} HP {}% 能量 {}\n已观测敌方情报:\n{}\n可用技能:\n{}\n可切换精灵:\n{}\n最近战报:\n{}\n仅输出一行动作。",
         side,
         round,
         own.name,
+        own.level,
         own.nature,
+        effort_summary(&own.effort),
         own.cur_hp,
         own.hp,
         own.energy,
         own.speed,
         opp.name,
-        opp.nature,
-        opp.cur_hp,
-        opp.hp,
+        enemy_hp_pct,
         opp.energy,
-        opp.speed,
+        enemy_intel,
         skills_text,
         switch_text,
         tail
@@ -716,6 +813,43 @@ async fn llm_choose_action(
             .unwrap_or_default(),
         own,
     ))
+}
+
+fn observed_enemy_intel(side: &str, history: &str) -> String {
+    let enemy_side = if side == "A" { "B方" } else { "A方" };
+    let mut seen_pets: Vec<String> = Vec::new();
+    let mut shown_skills: Vec<String> = Vec::new();
+    for line in history.lines() {
+        if !line.starts_with(enemy_side) {
+            continue;
+        }
+        if let Some(pos) = line.find(" 上场：") {
+            let name = line[pos + " 上场：".len()..].trim_end_matches('。').trim();
+            if !name.is_empty() && !seen_pets.iter().any(|x| x == name) {
+                seen_pets.push(name.to_string());
+            }
+        }
+        if let Some(pos) = line.find(" 使用 [") {
+            let rest = &line[pos + " 使用 [".len()..];
+            if let Some(end) = rest.find(']') {
+                let skill = rest[..end].trim();
+                if !skill.is_empty() && !shown_skills.iter().any(|x| x == skill) {
+                    shown_skills.push(skill.to_string());
+                }
+            }
+        }
+    }
+    let pets_text = if seen_pets.is_empty() {
+        "无".to_string()
+    } else {
+        seen_pets.join("，")
+    };
+    let skills_text = if shown_skills.is_empty() {
+        "无".to_string()
+    } else {
+        shown_skills.join("，")
+    };
+    format!("- 敌方已出战精灵: {}\n- 敌方已展示技能: {}", pets_text, skills_text)
 }
 
 fn type_multiplier(attack_type: &str, def1: &str, def2: Option<&str>) -> f32 {
@@ -838,6 +972,11 @@ fn build_battle_team(
     side: &str,
 ) -> Result<Vec<BattlePet>, String> {
     let mut out = Vec::new();
+    let mut seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(42)
+        ^ side.bytes().map(|b| b as u64).sum::<u64>();
     for (pet_name, nature_name, skill_names) in raw_team {
         let pet = pet_index
             .get(pet_name)
@@ -859,18 +998,50 @@ fn build_battle_team(
                 effect,
             });
         }
+        let effort = random_effort_values(&mut seed);
+        let hp = calculate_hp(pet.hp.max(1), PVP_DEFAULT_INDIVIDUAL_VALUE, PVP_DEFAULT_MAGNIFICATION) + effort.hp;
+        let patk = calculate_stat(
+            pet.physical_attack.max(1),
+            PVP_DEFAULT_INDIVIDUAL_VALUE,
+            PVP_DEFAULT_MAGNIFICATION,
+        ) + effort.patk;
+        let pdef = calculate_stat(
+            pet.physical_defense.max(1),
+            PVP_DEFAULT_INDIVIDUAL_VALUE,
+            PVP_DEFAULT_MAGNIFICATION,
+        ) + effort.pdef;
+        let matk = calculate_stat(
+            pet.magic_attack.max(1),
+            PVP_DEFAULT_INDIVIDUAL_VALUE,
+            PVP_DEFAULT_MAGNIFICATION,
+        ) + effort.matk;
+        let mdef = calculate_stat(
+            pet.magic_defense.max(1),
+            PVP_DEFAULT_INDIVIDUAL_VALUE,
+            PVP_DEFAULT_MAGNIFICATION,
+        ) + effort.mdef;
+        let speed = calculate_stat(
+            pet.speed.max(1),
+            PVP_DEFAULT_INDIVIDUAL_VALUE,
+            PVP_DEFAULT_MAGNIFICATION,
+        ) + effort.speed;
         out.push(BattlePet {
             name: pet.name.clone(),
+            level: PVP_DEFAULT_LEVEL,
             nature: normalize_nature_name(nature_name),
             element1: pet.element.clone(),
-            element2: if pet.element2.trim().is_empty() { None } else { Some(pet.element2.clone()) },
-            hp: pet.hp.max(1),
-            cur_hp: pet.hp.max(1),
-            speed: pet.speed.max(1),
-            patk: pet.physical_attack.max(1),
-            pdef: pet.physical_defense.max(1),
-            matk: pet.magic_attack.max(1),
-            mdef: pet.magic_defense.max(1),
+            element2: pet
+                .element2
+                .as_ref()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
+            hp,
+            cur_hp: hp,
+            speed,
+            patk,
+            pdef,
+            matk,
+            mdef,
             energy: 0,
             poison_layers: 0,
             burn_layers: 0,
@@ -882,6 +1053,7 @@ fn build_battle_team(
             has_entered_once: false,
             entry_leave_immune: false,
             morph_stage: 0,
+            effort,
             skills,
         });
     }
@@ -977,6 +1149,18 @@ fn parse_power(s: &str) -> i32 {
     s.parse::<i32>().unwrap_or(60).max(1)
 }
 
+fn calculate_hp(base_hp: i32, individual_value: i32, magnification: f32) -> i32 {
+    let mut hp = ((base_hp + individual_value * 3) as f32 * 1.7 + 70.5).floor() as i32;
+    hp = (hp as f32 * magnification).floor() as i32 + 100;
+    hp.max(1)
+}
+
+fn calculate_stat(base_stat: i32, individual_value: i32, magnification: f32) -> i32 {
+    let mut stat = ((base_stat + individual_value * 3) as f32 * 1.1 + 10.5).floor() as i32;
+    stat = (stat as f32 * magnification).floor() as i32 + 50;
+    stat.max(1)
+}
+
 fn parse_cost(s: &str) -> i32 {
     s.parse::<i32>().unwrap_or(2).max(0)
 }
@@ -993,6 +1177,56 @@ fn shuffle_indices(arr: &mut [usize], seed: &mut u64) {
     for i in (1..arr.len()).rev() {
         let j = rand_index(seed, i + 1);
         arr.swap(i, j);
+    }
+}
+
+fn random_effort_values(seed: &mut u64) -> EffortValues {
+    let stat_count = rand_index(seed, 3) + 1; // 1..=3
+    let mut idxs = [0usize, 1, 2, 3, 4, 5];
+    for i in (1..idxs.len()).rev() {
+        let j = rand_index(seed, i + 1);
+        idxs.swap(i, j);
+    }
+    let mut ev = EffortValues::default();
+    for idx in idxs.iter().take(stat_count) {
+        let base = PVP_EFFORT_BASE_MIN + rand_index(seed, (PVP_EFFORT_BASE_MAX - PVP_EFFORT_BASE_MIN + 1) as usize) as i32;
+        let value = base * PVP_EFFORT_MULTIPLIER;
+        match idx {
+            0 => ev.hp = value,
+            1 => ev.patk = value,
+            2 => ev.matk = value,
+            3 => ev.pdef = value,
+            4 => ev.mdef = value,
+            _ => ev.speed = value,
+        }
+    }
+    ev
+}
+
+fn effort_summary(e: &EffortValues) -> String {
+    let mut parts = Vec::new();
+    if e.hp > 0 {
+        parts.push(format!("生命+{}", e.hp));
+    }
+    if e.patk > 0 {
+        parts.push(format!("物攻+{}", e.patk));
+    }
+    if e.matk > 0 {
+        parts.push(format!("魔攻+{}", e.matk));
+    }
+    if e.pdef > 0 {
+        parts.push(format!("物防+{}", e.pdef));
+    }
+    if e.mdef > 0 {
+        parts.push(format!("魔防+{}", e.mdef));
+    }
+    if e.speed > 0 {
+        parts.push(format!("速度+{}", e.speed));
+    }
+    if parts.is_empty() {
+        "无".to_string()
+    } else {
+        parts.join("、")
     }
 }
 
@@ -1606,6 +1840,20 @@ fn nature_multiplier(nature: &str, stat: &str) -> f32 {
     } else {
         1.0
     }
+}
+
+fn safe_tail_chars(text: &str, max_chars: usize) -> &str {
+    let total_chars = text.chars().count();
+    if total_chars <= max_chars {
+        return text;
+    }
+    let skip = total_chars - max_chars;
+    let start = text
+        .char_indices()
+        .nth(skip)
+        .map(|(idx, _)| idx)
+        .unwrap_or(0);
+    &text[start..]
 }
 
 fn is_immune_to_poison(p: &BattlePet) -> bool {
