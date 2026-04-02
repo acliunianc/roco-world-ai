@@ -1,6 +1,6 @@
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde::de::{self, Visitor};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashMap;
 use std::error::Error as StdError;
@@ -8,6 +8,11 @@ use std::fs;
 use std::fmt;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use crate::replay::{
+    events_to_frames, write_battle_report, BattleReport, InitialState, PetInitialState,
+    PetStatusSnapshot, RoundReport, SkillView, StatusEffectView,
+};
 
 const PVP_DEFAULT_LEVEL: i32 = 60;
 const PVP_DEFAULT_INDIVIDUAL_VALUE: i32 = 0;
@@ -248,39 +253,6 @@ struct DedicationBuff {
     cost_reduction_times: i32,
 }
 
-#[derive(Serialize)]
-struct BattleReport {
-    started_at_ms: u128,
-    setup_mode: String,
-    winner: String,
-    final_life_a: i32,
-    final_life_b: i32,
-    rounds: Vec<RoundReport>,
-}
-
-#[derive(Serialize)]
-struct RoundReport {
-    round: i32,
-    round_label: String,
-    acting_order: String,
-    decision_a: String,
-    decision_b: String,
-    active_a: String,
-    active_b: String,
-    hp_a_before: i32,
-    hp_b_before: i32,
-    hp_a_after: i32,
-    hp_b_after: i32,
-    energy_a_before: i32,
-    energy_b_before: i32,
-    energy_a_after: i32,
-    energy_b_after: i32,
-    life_a_after: i32,
-    life_b_after: i32,
-    round_log: String,
-    events: Vec<String>,
-}
-
 pub async fn run_ai_battle_stream<F>(
     setup_mode: AiBattleSetupMode,
     fixed_team_a_raw: String,
@@ -303,6 +275,10 @@ where
     };
     let mut team_a = build_battle_team(&team_a_raw, &pet_index, "A")?;
     let mut team_b = build_battle_team(&team_b_raw, &pet_index, "B")?;
+    let initial_state = InitialState {
+        team_a: build_initial_team_state(&team_a),
+        team_b: build_initial_team_state(&team_b),
+    };
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(8))
         .timeout(Duration::from_secs(60))
@@ -336,17 +312,27 @@ where
         if a_life <= 0 || b_life <= 0 {
             break;
         }
-        while a_active < team_a.len() && team_a[a_active].cur_hp <= 0 {
-            a_active += 1;
+        if a_active >= team_a.len() || team_a[a_active].cur_hp <= 0 {
+            if let Some(idx) = first_alive_index(&team_a) {
+                a_active = idx;
+            } else {
+                a_active = team_a.len();
+            }
         }
-        while b_active < team_b.len() && team_b[b_active].cur_hp <= 0 {
-            b_active += 1;
+        if b_active >= team_b.len() || team_b[b_active].cur_hp <= 0 {
+            if let Some(idx) = first_alive_index(&team_b) {
+                b_active = idx;
+            } else {
+                b_active = team_b.len();
+            }
         }
         if a_active >= team_a.len() || b_active >= team_b.len() {
             break;
         }
 
-        on_delta(&format!("\n【回合 {}】\n", round));
+        let round_header = format!("\n【回合 {}】\n", round);
+        history.push_str(&round_header);
+        on_delta(&round_header);
         let round_log_start_len = history.len();
         let a_snapshot = team_a[a_active].clone();
         let b_snapshot = team_b[b_active].clone();
@@ -593,13 +579,12 @@ where
         } else {
             String::new()
         };
-        let events = round_body
+        let event_lines = round_body
             .lines()
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string)
             .collect::<Vec<_>>();
-        let round_log = round_body;
         report_rounds.push(RoundReport {
             round,
             round_label: format!("回合{}", round),
@@ -608,6 +593,10 @@ where
             decision_b: decision_to_text(&b_decision),
             active_a: team_a[a_active].name.clone(),
             active_b: team_b[b_active].name.clone(),
+            hp_a_max: team_a[a_active].hp,
+            hp_b_max: team_b[b_active].hp,
+            energy_a_max: MAX_ENERGY,
+            energy_b_max: MAX_ENERGY,
             hp_a_before,
             hp_b_before,
             hp_a_after: team_a[a_active].cur_hp,
@@ -618,27 +607,27 @@ where
             energy_b_after: team_b[b_active].energy,
             life_a_after: a_life,
             life_b_after: b_life,
-            round_log,
-            events,
+            alive_a: alive_pet_names(&team_a),
+            alive_b: alive_pet_names(&team_b),
+            status_effects: snapshot_status_effects(&team_a[a_active], &team_b[b_active]),
+            events: events_to_frames(&event_lines),
         });
     }
 
-    let winner = if a_life > b_life {
-        on_delta("\n=== 对战结束：A 方获胜 ===\n");
-        "A".to_string()
-    } else if b_life > a_life {
-        on_delta("\n=== 对战结束：B 方获胜 ===\n");
-        "B".to_string()
-    } else {
-        on_delta("\n=== 对战结束：平局 ===\n");
-        "Draw".to_string()
-    };
+    let winner = resolve_winner_no_draw(a_life, b_life, &team_a, &team_b);
+    match winner.as_str() {
+        "A" => on_delta("\n=== 对战结束：A 方获胜 ===\n"),
+        "B" => on_delta("\n=== 对战结束：B 方获胜 ===\n"),
+        _ => on_delta("\n=== 对战结束：A 方获胜（决胜规则） ===\n"),
+    }
     let report = BattleReport {
+        schema_version: "2.0".to_string(),
         started_at_ms: report_started_at_ms,
         setup_mode: setup_mode_text(setup_mode).to_string(),
         winner,
         final_life_a: a_life,
         final_life_b: b_life,
+        initial_state,
         rounds: report_rounds,
     };
     let path = write_battle_report(&report)?;
@@ -674,7 +663,8 @@ fn resolve_one_attack<F: FnMut(&str)>(
     }
     attacker.energy -= actual_cost;
 
-    if skill.effect.contains("蓄力") {
+    let is_releasing_charged_skill = attacker.charging_skill.as_deref() == Some(skill.name.as_str());
+    if skill.effect.contains("蓄力") && !is_releasing_charged_skill {
         attacker.charging_skill = Some(skill.name.clone());
         let msg = format!("{}方 {} 使用 [{}] 进入蓄力状态，本回合不造成伤害。\n", side, attacker.name, skill.name);
         history.push_str(&msg);
@@ -736,10 +726,24 @@ fn resolve_one_attack<F: FnMut(&str)>(
     defender.cur_hp = (defender.cur_hp - dmg).max(0);
     attacker.entry_bonus_power = 0;
 
-    let msg = format!(
-        "{}方 {} 使用 [{}]，消耗{}能量，造成 {} 伤害(克制x{:.2})。{} HP: {}/{}\n",
-        side, attacker.name, skill.name, actual_cost, dmg, type_mul, defender.name, defender.cur_hp, defender.hp
-    );
+    let msg = if is_damage_skill {
+        if (type_mul - 1.0).abs() < 0.001 {
+            format!(
+                "{}方 {} 使用 [{}]，消耗{}能量，造成 {} 伤害。{} HP: {}/{}\n",
+                side, attacker.name, skill.name, actual_cost, dmg, defender.name, defender.cur_hp, defender.hp
+            )
+        } else {
+            format!(
+                "{}方 {} 使用 [{}]，消耗{}能量，造成 {} 伤害(克制x{:.2})。{} HP: {}/{}\n",
+                side, attacker.name, skill.name, actual_cost, dmg, type_mul, defender.name, defender.cur_hp, defender.hp
+            )
+        }
+    } else {
+        format!(
+            "{}方 {} 使用 [{}]，消耗{}能量，施加状态/效果。{} HP: {}/{}\n",
+            side, attacker.name, skill.name, actual_cost, defender.name, defender.cur_hp, defender.hp
+        )
+    };
     history.push_str(&msg);
     on_delta(&msg);
     if defender.cur_hp <= 0 {
@@ -776,7 +780,7 @@ fn resolve_one_attack<F: FnMut(&str)>(
         on_delta(&msg);
     }
     apply_weather_from_skill(weather, &skill, history, on_delta);
-    if attacker.charging_skill.as_deref() == Some(skill.name.as_str()) {
+    if is_releasing_charged_skill {
         attacker.charging_skill = None;
     }
 }
@@ -998,7 +1002,6 @@ async fn llm_choose_action(
     } else {
         blocked_names.join("，")
     };
-    let tail = safe_tail_chars(history, 1200);
     let switchable = own_team
         .iter()
         .enumerate()
@@ -1022,45 +1025,79 @@ async fn llm_choose_action(
     } else {
         legal_actions.join(" | ")
     };
-    let own_reserve_text = own_team
+    let own_team_full_text = own_team
         .iter()
         .enumerate()
-        .filter(|(i, p)| *i != active_index && p.cur_hp > 0)
-        .map(|(_, p)| {
+        .map(|(idx, p)| {
             let skills = p
                 .skills
                 .iter()
                 .map(|s| {
                     format!(
-                        "{}(耗{} 威{} {} 效果:{})",
+                        "{}({}/{}/耗{}{})",
                         s.name,
-                        calc_skill_cost(s, weather),
                         s.power,
                         s.category,
-                        if s.effect.trim().is_empty() { "无" } else { s.effect.trim() }
+                        calc_skill_cost(s, weather),
+                        if s.effect.trim().is_empty() {
+                            "".to_string()
+                        } else {
+                            format!("/{}", s.effect.trim())
+                        }
                     )
                 })
                 .collect::<Vec<_>>()
-                .join("；");
+                .join("，");
             format!(
-                "- {} 属性:{} HP {}/{} 能量{} 速度{} 状态:{} | 特性:{}({}) | 技能: {}",
+                "- {}{}: {} [{}] HP {}/{} EN{} SPD{} 特性:{}({}) 技能:{}",
+                if idx == active_index { "*" } else { "" },
+                idx + 1,
                 p.name,
                 pet_element_summary(p),
                 p.cur_hp,
                 p.hp,
                 p.energy,
                 p.speed,
-                pet_status_summary(p),
                 if p.ability.trim().is_empty() { "无" } else { p.ability.trim() },
                 if p.ability_desc.trim().is_empty() { "无" } else { p.ability_desc.trim() },
                 skills
             )
         })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let own_reserve_compact_text = own_team
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != active_index)
+        .enumerate()
+        .map(|(idx, (_, p))| {
+            let ability = if p.ability.trim().is_empty() {
+                String::new()
+            } else {
+                format!(" [特性:{}]", p.ability.trim())
+            };
+            format!(
+                "{}. {}({}) {}/{} EN:{} SPD:{}{}",
+                idx + 1,
+                p.name,
+                pet_element_summary(p),
+                p.cur_hp,
+                p.hp,
+                p.energy,
+                p.speed,
+                ability
+            )
+        })
         .collect::<Vec<_>>();
-    let own_reserve_text = if own_reserve_text.is_empty() {
+    let own_reserve_compact_text = if own_reserve_compact_text.is_empty() {
         "无".to_string()
     } else {
-        own_reserve_text.join("\n")
+        own_reserve_compact_text.join("\n")
+    };
+    let own_team_context = if round <= 1 {
+        format!("### 我方全队完整情报(仅R1提供) ###\n{}", own_team_full_text)
+    } else {
+        format!("### 后备选择 ###\n{}", own_reserve_compact_text)
     };
 
     let enemy_hp_pct = if opp.hp > 0 {
@@ -1069,41 +1106,49 @@ async fn llm_choose_action(
         0
     };
     let enemy_intel = observed_enemy_intel(side, history);
-    let user = format!(
-        "你是{}方决策AI。\n规则摘要：每回合输出一个动作；程序负责结算。\n信息限制：你只能确定敌方当前精灵名、血量百分比、能量；无法直接得知敌方性格、努力值、速度、属性细节、未登场精灵。\n你可以利用历史战报中的已观测信息（敌方释放过的技能、敌方上场过的精灵）进行记忆与推断。\n硬性规则：绝对不能选择能量不足的技能；下方“可用技能”即当前可合法选择的技能集合。\n硬性规则：只能切换到“可切换精灵”中给出的名字，禁止虚构不存在精灵。\n硬性规则：CHARGE(回能)为每回合都可用的独立指令。\n合法输出格式三选一：\n1) SKILL:技能名\n2) SWITCH:精灵名\n3) CHARGE\n回合:{}\n天气:{}\n我方印记: 负面={} 正面={}\n敌方印记(可见): 负面={} 正面={}\n我方当前:{}(属性:{} Lv{} 性格:{} 努力值:{} 特性:{}({})) HP {}/{}({}%) 能量 {} 速度 {} 状态:{}\n敌方当前:{}(属性:{}) HP {}% 能量 {} 状态:{}\n我方后备精灵与技能:\n{}\n已观测敌方情报:\n{}\n可用技能:\n{}\n不可用技能(能量不足):\n{}\n可切换精灵:\n{}\n本回合合法动作全集:\n{}\n最近战报:\n{}\n仅输出一行动作。",
-        side,
-        round,
-        weather_summary(weather),
-        negative_imprint_summary(own_negative_imprint),
-        positive_imprint_summary(own_positive_imprint),
-        negative_imprint_summary(enemy_negative_imprint),
-        positive_imprint_summary(enemy_positive_imprint),
-        own.name,
-        pet_element_summary(own),
-        own.level,
-        own.nature,
-        effort_summary(&own.effort),
-        if own.ability.trim().is_empty() { "无" } else { own.ability.trim() },
-        if own.ability_desc.trim().is_empty() { "无" } else { own.ability_desc.trim() },
-        own.cur_hp,
-        own.hp,
-        hp_percent(own),
-        own.energy,
-        own.speed,
-        pet_status_summary(own),
-        opp.name,
-        pet_element_summary(opp),
-        enemy_hp_pct,
-        opp.energy,
-        pet_status_summary(opp),
-        own_reserve_text,
+    let recent_dyn = compact_recent_dynamics(history, 5, 8);
+    let user = [
+        format!("你是{}方决策AI。每回合仅输出一行合法动作：SKILL:技能名 / SWITCH:精灵名 / CHARGE。", side),
+        "### 状态快照 ###".to_string(),
+        format!(
+            "R{} | 天气:{}\n我方: {}({}) {}/{}({}%) EN:{} SPD:{} [特性:{}]\n敌方: {}({}) HP:{}% EN:{}",
+            round,
+            weather_summary(weather),
+            own.name,
+            pet_element_summary(own),
+            own.cur_hp,
+            own.hp,
+            hp_percent(own),
+            own.energy,
+            own.speed,
+            if own.ability.trim().is_empty() { "无" } else { own.ability.trim() },
+            opp.name,
+            pet_element_summary(opp),
+            enemy_hp_pct,
+            opp.energy
+        ),
+        "### 敌方情报摘要 ###".to_string(),
+        format!(
+            "- 我方印记: 负面={} 正面={}\n- 敌方印记(可见): 负面={} 正面={}",
+            negative_imprint_summary(own_negative_imprint),
+            positive_imprint_summary(own_positive_imprint),
+            negative_imprint_summary(enemy_negative_imprint),
+            positive_imprint_summary(enemy_positive_imprint)
+        ),
+        own_team_context,
         enemy_intel,
+        "### 可用技能 ###".to_string(),
         skills_text,
+        "### 不可用技能 ###".to_string(),
         blocked_text,
+        "### 可切换精灵 ###".to_string(),
         switch_text,
+        "### 最近动态 ###".to_string(),
+        recent_dyn,
+        "### 合法动作 ###".to_string(),
         legal_actions_text,
-        tail
-    );
+    ]
+    .join("\n");
     let system_prompt = battle_rule_prompt();
     if include_system_prompt {
         println!(
@@ -1191,6 +1236,9 @@ fn battle_rule_prompt() -> &'static str {
 5) 属性克制：单克制2.0，单抵抗0.5；双属性双克制3.0，双属性双抵抗0.25。\n\
 6) 伤害核心：攻击/防御×0.9×威力×克制×本系加成，并受天气/词条影响。\n\
 7) 状态与词条按战报与规则结算（中毒/灼烧/冻结/寄生/萌化/印记/天气等）。\n\
+   - 换下场后会清除：中毒、灼烧、寄生。\n\
+   - 换下场后不会清除：冻结、萌化。\n\
+   - 场地印记默认不会因换宠自动清除；仅在技能效果明确写“清除印记/覆盖印记”时改变。\n\
 8) 信息可见性限制：你不能直接知道敌方隐藏信息（性格、努力值、未登场精灵等），只能基于当前可见状态和历史观测推断。\n\
 9) 若某技能当前能量不足则视为非法选择，不得输出该技能。\n\
 10) 应对触发规则：\n\
@@ -2438,18 +2486,59 @@ fn nature_multiplier(nature: &str, stat: &str) -> f32 {
     }
 }
 
-fn safe_tail_chars(text: &str, max_chars: usize) -> &str {
-    let total_chars = text.chars().count();
-    if total_chars <= max_chars {
-        return text;
+fn recent_round_history(history: &str, keep_rounds: usize) -> String {
+    if keep_rounds == 0 || history.trim().is_empty() {
+        return "无".to_string();
     }
-    let skip = total_chars - max_chars;
-    let start = text
-        .char_indices()
-        .nth(skip)
-        .map(|(idx, _)| idx)
-        .unwrap_or(0);
-    &text[start..]
+    let marker = "\n【回合 ";
+    let mut starts = history.match_indices(marker).map(|(idx, _)| idx).collect::<Vec<_>>();
+    if history.starts_with("【回合 ") {
+        starts.insert(0, 0);
+    }
+    if starts.is_empty() {
+        return history.to_string();
+    }
+    let start_idx = if starts.len() > keep_rounds {
+        starts[starts.len() - keep_rounds]
+    } else {
+        starts[0]
+    };
+    history[start_idx..].trim().to_string()
+}
+
+fn compact_recent_dynamics(history: &str, keep_rounds: usize, max_lines: usize) -> String {
+    let recent = recent_round_history(history, keep_rounds);
+    if recent == "无" {
+        return recent;
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut current_round = String::new();
+    for line in recent.lines() {
+        let text = line.trim();
+        if text.is_empty() {
+            continue;
+        }
+        if text.starts_with("【回合 ") && text.ends_with("】") {
+            current_round = text
+                .trim_start_matches("【回合 ")
+                .trim_end_matches("】")
+                .to_string();
+            continue;
+        }
+        if current_round.is_empty() {
+            out.push(text.to_string());
+        } else {
+            out.push(format!("R{}: {}", current_round, text));
+        }
+        if out.len() >= max_lines {
+            break;
+        }
+    }
+    if out.is_empty() {
+        "无".to_string()
+    } else {
+        out.join("\n")
+    }
 }
 
 fn add_energy_capped(current: i32, delta: i32) -> i32 {
@@ -2471,13 +2560,114 @@ fn setup_mode_text(mode: AiBattleSetupMode) -> &'static str {
     }
 }
 
-fn write_battle_report(report: &BattleReport) -> Result<String, String> {
-    let dir = "data/battle-reports";
-    fs::create_dir_all(dir).map_err(|e| format!("创建战报目录失败: {}", e))?;
-    let filename = format!("{}/battle-report-{}.json", dir, report.started_at_ms);
-    let content = serde_json::to_string_pretty(report).map_err(|e| format!("序列化战报失败: {}", e))?;
-    fs::write(&filename, content).map_err(|e| format!("写入战报失败: {}", e))?;
-    Ok(filename)
+fn build_initial_team_state(team: &[BattlePet]) -> Vec<PetInitialState> {
+    team.iter()
+        .map(|p| PetInitialState {
+            name: p.name.clone(),
+            level: p.level,
+            element: p.element1.clone(),
+            element2: p.element2.clone(),
+            ability: p.ability.clone(),
+            hp_max: p.hp,
+            energy_max: MAX_ENERGY,
+            speed: p.speed,
+            patk: p.patk,
+            pdef: p.pdef,
+            matk: p.matk,
+            mdef: p.mdef,
+            skills: p
+                .skills
+                .iter()
+                .map(|s| SkillView {
+                    name: s.name.clone(),
+                    element: s.element.clone(),
+                    category: s.category.clone(),
+                    cost: s.cost,
+                    power: s.power,
+                })
+                .collect::<Vec<_>>(),
+        })
+        .collect::<Vec<_>>()
+}
+
+fn snapshot_status_effects(a: &BattlePet, b: &BattlePet) -> Vec<PetStatusSnapshot> {
+    vec![
+        PetStatusSnapshot {
+            side: "A".to_string(),
+            pet: a.name.clone(),
+            effects: collect_effects(a),
+        },
+        PetStatusSnapshot {
+            side: "B".to_string(),
+            pet: b.name.clone(),
+            effects: collect_effects(b),
+        },
+    ]
+}
+
+fn collect_effects(pet: &BattlePet) -> Vec<StatusEffectView> {
+    let mut out = Vec::new();
+    if pet.poison_layers > 0 {
+        out.push(StatusEffectView {
+            name: "中毒".to_string(),
+            layers: pet.poison_layers,
+        });
+    }
+    if pet.burn_layers > 0 {
+        out.push(StatusEffectView {
+            name: "灼烧".to_string(),
+            layers: pet.burn_layers,
+        });
+    }
+    if pet.freeze_layers > 0 {
+        out.push(StatusEffectView {
+            name: "冻结".to_string(),
+            layers: pet.freeze_layers,
+        });
+    }
+    if pet.parasitic_layers > 0 {
+        out.push(StatusEffectView {
+            name: "寄生".to_string(),
+            layers: pet.parasitic_layers,
+        });
+    }
+    out
+}
+
+fn alive_pet_names(team: &[BattlePet]) -> Vec<String> {
+    team.iter()
+        .filter(|p| p.cur_hp > 0)
+        .map(|p| p.name.clone())
+        .collect::<Vec<_>>()
+}
+
+fn resolve_winner_no_draw(a_life: i32, b_life: i32, team_a: &[BattlePet], team_b: &[BattlePet]) -> String {
+    if a_life != b_life {
+        return if a_life > b_life { "A".to_string() } else { "B".to_string() };
+    }
+    let a_hp = team_total_hp(team_a);
+    let b_hp = team_total_hp(team_b);
+    if a_hp != b_hp {
+        return if a_hp > b_hp { "A".to_string() } else { "B".to_string() };
+    }
+    let a_energy = team_total_energy(team_a);
+    let b_energy = team_total_energy(team_b);
+    if a_energy != b_energy {
+        return if a_energy > b_energy { "A".to_string() } else { "B".to_string() };
+    }
+    "A".to_string()
+}
+
+fn team_total_hp(team: &[BattlePet]) -> i32 {
+    team.iter().map(|p| p.cur_hp.max(0)).sum()
+}
+
+fn team_total_energy(team: &[BattlePet]) -> i32 {
+    team.iter().map(|p| p.energy.max(0)).sum()
+}
+
+fn first_alive_index(team: &[BattlePet]) -> Option<usize> {
+    team.iter().position(|p| p.cur_hp > 0)
 }
 
 fn is_immune_to_poison(p: &BattlePet) -> bool {

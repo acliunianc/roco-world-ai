@@ -1,4 +1,5 @@
 mod battle;
+mod replay;
 
 use battle::AiBattleSetupMode;
 use dioxus::prelude::*;
