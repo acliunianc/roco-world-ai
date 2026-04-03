@@ -428,9 +428,11 @@ where
         };
         let a_counter = counter_triggered(&a_snapshot, &a_decision, &b_decision, &b_snapshot);
         let b_counter = counter_triggered(&b_snapshot, &b_decision, &a_decision, &a_snapshot);
-        let a_first = if a_counter && !b_counter {
+        let a_counter_priority = counter_grants_act_priority(&a_snapshot, &a_decision, &b_decision, &b_snapshot);
+        let b_counter_priority = counter_grants_act_priority(&b_snapshot, &b_decision, &a_decision, &a_snapshot);
+        let a_first = if a_counter_priority && !b_counter_priority {
             true
-        } else if b_counter && !a_counter {
+        } else if b_counter_priority && !a_counter_priority {
             false
         } else if a_priority == b_priority {
             effective_speed(&a_snapshot) >= effective_speed(&b_snapshot)
@@ -1379,7 +1381,7 @@ fn battle_rule_prompt() -> &'static str {
     "你是洛克王国PVP对战决策器。你必须严格遵守以下规则并只做一行动作决策：\n\
 1) 只允许输出一行：SKILL:技能名 或 SWITCH:精灵名 或 CHARGE，禁止解释。\n\
 2) 回合制；每回合只能行动一次；换宠也算行动。\n\
-3) 先手规则：先比较先手+X，再比较速度；应对成功可抢先处理。\n\
+3) 先手规则：先比较先手+X，再比较速度；非防御类技能在应对成功时可抢先出手；防御类技能即使应对成功也不因此抢先，仍按先手+X与速度排序。\n\
 4) 能量规则：技能需要足够能量才能释放；恢复类效果可回能；每只精灵默认满能量(10)；换宠不重置能量；CHARGE为每回合可用独立回能指令。\n\
 5) 属性克制：单克制2.0，单抵抗0.5；双属性双克制3.0，双属性双抵抗0.25。\n\
 6) 伤害核心：攻击/防御×0.9×威力×克制×本系加成，并受天气/词条影响。\n\
@@ -1665,6 +1667,20 @@ fn counter_triggered(self_pet: &BattlePet, self_decision: &Decision, opp_decisio
             }
         }
     }
+}
+
+/// 应对成功时是否因此获得当回合「抢先出手」；防御类技能不参与此项（仍按先手+X 与速度排序）。
+fn counter_grants_act_priority(self_pet: &BattlePet, self_decision: &Decision, opp_decision: &Decision, opp_pet: &BattlePet) -> bool {
+    if !counter_triggered(self_pet, self_decision, opp_decision, opp_pet) {
+        return false;
+    }
+    let Decision::UseSkill(skill_name) = self_decision else {
+        return false;
+    };
+    let Some(sk) = self_pet.skills.iter().find(|x| x.name == *skill_name) else {
+        return false;
+    };
+    sk.category != "防御"
 }
 
 fn build_pet_index(pets: &[PetJsonLite]) -> HashMap<String, PetJsonLite> {
