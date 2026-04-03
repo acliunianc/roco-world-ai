@@ -9,6 +9,7 @@ use std::fmt;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::pet_battle_patch::{ElementSkillBanks, PetBattlePatchEntry, PetBattlePatchTable};
 use crate::replay::{
     events_to_frames, write_battle_report, BattleReport, InitialState, PetInitialState,
     PetStatusSnapshot, RoundReport, SkillView, StatusEffectView,
@@ -176,6 +177,8 @@ struct BattlePet {
     matk: i32,
     mdef: i32,
     energy: i32,
+    /// 能量上限（常规为 MAX_ENERGY；补丁可提高到 99 等）
+    energy_cap: i32,
     poison_layers: i32,
     burn_layers: i32,
     freeze_layers: i32,
@@ -183,7 +186,6 @@ struct BattlePet {
     frozen_hp_locked: i32,
     charging_skill: Option<String>,
     entry_bonus_power: i32,
-    has_entered_once: bool,
     entry_leave_immune: bool,
     morph_stage: u8,
     effort: EffortValues,
@@ -273,8 +275,9 @@ where
         AiBattleSetupMode::Random => generate_random_teams(&pet_pool)?,
         AiBattleSetupMode::Fixed => (parse_fixed_team(&fixed_team_a_raw, "AI A")?, parse_fixed_team(&fixed_team_b_raw, "AI B")?),
     };
-    let mut team_a = build_battle_team(&team_a_raw, &pet_index, "A")?;
-    let mut team_b = build_battle_team(&team_b_raw, &pet_index, "B")?;
+    let pet_patches = PetBattlePatchTable::load_or_empty();
+    let mut team_a = build_battle_team(&team_a_raw, &pet_index, "A", &pet_patches)?;
+    let mut team_b = build_battle_team(&team_b_raw, &pet_index, "B", &pet_patches)?;
     let initial_state = InitialState {
         team_a: build_initial_team_state(&team_a),
         team_b: build_initial_team_state(&team_b),
@@ -304,9 +307,33 @@ where
     let mut b_need_system_prompt = true;
     let mut report_rounds: Vec<RoundReport> = Vec::new();
     let report_started_at_ms = current_millis();
+    let mut a_ally_counter_bank: i32 = 0;
+    let mut b_ally_counter_bank: i32 = 0;
+    let mut a_element_banks = ElementSkillBanks::default();
+    let mut b_element_banks = ElementSkillBanks::default();
 
-    apply_entry_effects("A", &mut team_a[a_active], a_negative_imprint, a_positive_imprint, &mut history, &mut on_delta);
-    apply_entry_effects("B", &mut team_b[b_active], b_negative_imprint, b_positive_imprint, &mut history, &mut on_delta);
+    apply_entry_effects(
+        "A",
+        &mut team_a[a_active],
+        a_negative_imprint,
+        a_positive_imprint,
+        &pet_patches,
+        &mut a_ally_counter_bank,
+        &mut a_element_banks,
+        &mut history,
+        &mut on_delta,
+    );
+    apply_entry_effects(
+        "B",
+        &mut team_b[b_active],
+        b_negative_imprint,
+        b_positive_imprint,
+        &pet_patches,
+        &mut b_ally_counter_bank,
+        &mut b_element_banks,
+        &mut history,
+        &mut on_delta,
+    );
 
     for round in 1..=200 {
         if a_life <= 0 || b_life <= 0 {
@@ -412,6 +439,19 @@ where
         };
         let acting_order = if a_first { "A_then_B" } else { "B_then_A" }.to_string();
 
+        if a_counter && !b_counter {
+            let nm = team_a[a_active].name.as_str();
+            if !pet_patches.is_ally_counter_bank_receiver(nm) {
+                a_ally_counter_bank = a_ally_counter_bank.saturating_add(1);
+            }
+        }
+        if b_counter && !a_counter {
+            let nm = team_b[b_active].name.as_str();
+            if !pet_patches.is_ally_counter_bank_receiver(nm) {
+                b_ally_counter_bank = b_ally_counter_bank.saturating_add(1);
+            }
+        }
+
         if a_first {
             a_decision = redecide_if_energy_insufficient(
                 &client,
@@ -445,6 +485,11 @@ where
                 &mut a_positive_imprint,
                 &mut b_positive_imprint,
                 &mut a_dedication,
+                &pet_patches,
+                &mut a_ally_counter_bank,
+                &mut b_ally_counter_bank,
+                &mut a_element_banks,
+                &mut b_element_banks,
                 &mut history,
                 &mut on_delta,
             );
@@ -481,6 +526,11 @@ where
                     &mut b_positive_imprint,
                     &mut a_positive_imprint,
                     &mut b_dedication,
+                    &pet_patches,
+                    &mut a_ally_counter_bank,
+                    &mut b_ally_counter_bank,
+                    &mut a_element_banks,
+                    &mut b_element_banks,
                     &mut history,
                     &mut on_delta,
                 );
@@ -518,6 +568,11 @@ where
                 &mut b_positive_imprint,
                 &mut a_positive_imprint,
                 &mut b_dedication,
+                &pet_patches,
+                &mut a_ally_counter_bank,
+                &mut b_ally_counter_bank,
+                &mut a_element_banks,
+                &mut b_element_banks,
                 &mut history,
                 &mut on_delta,
             );
@@ -554,6 +609,11 @@ where
                     &mut a_positive_imprint,
                     &mut b_positive_imprint,
                     &mut a_dedication,
+                    &pet_patches,
+                    &mut a_ally_counter_bank,
+                    &mut b_ally_counter_bank,
+                    &mut a_element_banks,
+                    &mut b_element_banks,
                     &mut history,
                     &mut on_delta,
                 );
@@ -595,8 +655,8 @@ where
             active_b: team_b[b_active].name.clone(),
             hp_a_max: team_a[a_active].hp,
             hp_b_max: team_b[b_active].hp,
-            energy_a_max: MAX_ENERGY,
-            energy_b_max: MAX_ENERGY,
+            energy_a_max: team_a[a_active].energy_cap,
+            energy_b_max: team_b[b_active].energy_cap,
             hp_a_before,
             hp_b_before,
             hp_a_after: team_a[a_active].cur_hp,
@@ -635,6 +695,48 @@ where
     Ok(())
 }
 
+fn team_should_tally_element_skill_use(
+    pet_patches: &PetBattlePatchTable,
+    team: &[BattlePet],
+    attacker_name: &str,
+    skill_element: &str,
+) -> bool {
+    if skill_element != "冰" && skill_element != "火" && skill_element != "地" {
+        return false;
+    }
+    team.iter().filter(|p| p.cur_hp > 0).any(|receiver| {
+        let Some(e) = pet_patches.get(&receiver.name) else {
+            return false;
+        };
+        let Some(rule) = &e.on_entry_per_element_skill_bank else {
+            return false;
+        };
+        if rule.element != skill_element {
+            return false;
+        }
+        !rule.exclude_self_as_attacker || receiver.name != attacker_name
+    })
+}
+
+fn tally_element_skill_use_for_side(
+    own_team: &[BattlePet],
+    attacker_name: &str,
+    skill_element: &str,
+    banks: &mut ElementSkillBanks,
+    pet_patches: &PetBattlePatchTable,
+) {
+    if !team_should_tally_element_skill_use(pet_patches, own_team, attacker_name, skill_element) {
+        return;
+    }
+    match skill_element {
+        "冰" => banks.ice = banks.ice.saturating_add(1),
+        "火" => banks.fire = banks.fire.saturating_add(1),
+        "地" => banks.earth = banks.earth.saturating_add(1),
+        _ => {}
+    }
+}
+
+/// 若本回合成功出手（含蓄力出手），返回 `(出手精灵名, 技能属性)` 供冰/火/地入场补丁计数。
 fn resolve_one_attack<F: FnMut(&str)>(
     side: &str,
     chosen_skill: &str,
@@ -644,7 +746,7 @@ fn resolve_one_attack<F: FnMut(&str)>(
     weather: &mut Option<WeatherState>,
     history: &mut String,
     on_delta: &mut F,
-) {
+) -> Option<(String, String)> {
     let skill = attacker
         .skills
         .iter()
@@ -659,7 +761,7 @@ fn resolve_one_attack<F: FnMut(&str)>(
         let msg = format!("{}方 {} 试图使用 [{}]，能量不足，行动失败。\n", side, attacker.name, skill.name);
         history.push_str(&msg);
         on_delta(&msg);
-        return;
+        return None;
     }
     attacker.energy -= actual_cost;
 
@@ -670,7 +772,7 @@ fn resolve_one_attack<F: FnMut(&str)>(
         history.push_str(&msg);
         on_delta(&msg);
         apply_weather_from_skill(weather, &skill, history, on_delta);
-        return;
+        return Some((attacker.name.clone(), skill.element.clone()));
     }
 
     let type_mul = type_multiplier(&skill.element, &defender.element1, defender.element2.as_deref());
@@ -774,7 +876,8 @@ fn resolve_one_attack<F: FnMut(&str)>(
         }
     }
     if skill.effect.contains("恢复") {
-        attacker.energy = add_energy_capped(attacker.energy, 5);
+        let cap = attacker.energy_cap;
+        attacker.energy = add_energy_clamped(attacker.energy, 5, cap);
         let msg = format!("{}方 {} 的恢复效果触发，回复 5 点能量（当前{}）。\n", side, attacker.name, attacker.energy);
         history.push_str(&msg);
         on_delta(&msg);
@@ -783,6 +886,7 @@ fn resolve_one_attack<F: FnMut(&str)>(
     if is_releasing_charged_skill {
         attacker.charging_skill = None;
     }
+    Some((attacker.name.clone(), skill.element.clone()))
 }
 
 fn apply_end_turn_status<F: FnMut(&str)>(pet: &mut BattlePet, opp: &mut BattlePet, history: &mut String, on_delta: &mut F) {
@@ -838,6 +942,11 @@ fn execute_decision<F: FnMut(&str)>(
     own_positive_imprint: &mut Option<PositiveImprint>,
     _opp_positive_imprint: &mut Option<PositiveImprint>,
     own_dedication: &mut DedicationBuff,
+    pet_patches: &PetBattlePatchTable,
+    a_ally_counter_bank: &mut i32,
+    b_ally_counter_bank: &mut i32,
+    a_element_banks: &mut ElementSkillBanks,
+    b_element_banks: &mut ElementSkillBanks,
     history: &mut String,
     on_delta: &mut F,
 ) {
@@ -845,7 +954,7 @@ fn execute_decision<F: FnMut(&str)>(
         Decision::UseSkill(skill) => {
             if *own_active < own_team.len() {
                 let used_skill_name = skill.clone();
-                resolve_one_attack(
+                let tally = resolve_one_attack(
                     side,
                     skill,
                     &mut own_team[*own_active],
@@ -855,6 +964,19 @@ fn execute_decision<F: FnMut(&str)>(
                     history,
                     on_delta,
                 );
+                if let Some((an, el)) = tally {
+                    tally_element_skill_use_for_side(
+                        &*own_team,
+                        &an,
+                        &el,
+                        if side == "A" {
+                            a_element_banks
+                        } else {
+                            b_element_banks
+                        },
+                        pet_patches,
+                    );
+                }
                 apply_field_imprint_from_skill(
                     &own_team[*own_active],
                     skill,
@@ -874,6 +996,11 @@ fn execute_decision<F: FnMut(&str)>(
                     *own_negative_imprint,
                     *own_positive_imprint,
                     own_dedication,
+                    pet_patches,
+                    a_ally_counter_bank,
+                    b_ally_counter_bank,
+                    a_element_banks,
+                    b_element_banks,
                     history,
                     on_delta,
                 );
@@ -896,15 +1023,27 @@ fn execute_decision<F: FnMut(&str)>(
                 let msg = format!("{}方选择换宠，上场：{}。\n", side, own_team[*own_active].name);
                 history.push_str(&msg);
                 on_delta(&msg);
+                let ally_bank = if side == "A" {
+                    a_ally_counter_bank
+                } else {
+                    b_ally_counter_bank
+                };
                 apply_entry_effects(
                     side,
                     &mut own_team[*own_active],
                     *own_negative_imprint,
                     *own_positive_imprint,
+                    pet_patches,
+                    ally_bank,
+                    if side == "A" {
+                        a_element_banks
+                    } else {
+                        b_element_banks
+                    },
                     history,
                     on_delta,
                 );
-                trigger_swift_on_entry(
+                let swift_tally = trigger_swift_on_entry(
                     side,
                     &mut own_team[*own_active],
                     opp_active_pet,
@@ -913,6 +1052,14 @@ fn execute_decision<F: FnMut(&str)>(
                     history,
                     on_delta,
                 );
+                if let Some((an, el)) = swift_tally {
+                    let banks = if side == "A" {
+                        a_element_banks
+                    } else {
+                        b_element_banks
+                    };
+                    tally_element_skill_use_for_side(&*own_team, &an, &el, banks, pet_patches);
+                }
             } else {
                 let msg = format!("{}方尝试换宠到 [{}] 失败（不存在或已倒下），本回合行动失败。\n", side, target_name);
                 history.push_str(&msg);
@@ -921,8 +1068,9 @@ fn execute_decision<F: FnMut(&str)>(
         }
         Decision::Charge => {
             if *own_active < own_team.len() && own_team[*own_active].cur_hp > 0 {
+                let cap = own_team[*own_active].energy_cap;
                 own_team[*own_active].energy =
-                    add_energy_capped(own_team[*own_active].energy, CHARGE_ENERGY_GAIN);
+                    add_energy_clamped(own_team[*own_active].energy, CHARGE_ENERGY_GAIN, cap);
                 let msg = format!(
                     "{}方 {} 使用 [回能]，回复 {} 点能量（当前{}）。\n",
                     side,
@@ -1232,7 +1380,7 @@ fn battle_rule_prompt() -> &'static str {
 1) 只允许输出一行：SKILL:技能名 或 SWITCH:精灵名 或 CHARGE，禁止解释。\n\
 2) 回合制；每回合只能行动一次；换宠也算行动。\n\
 3) 先手规则：先比较先手+X，再比较速度；应对成功可抢先处理。\n\
-4) 能量规则：技能需要足够能量才能释放；恢复类效果可回能；首发上场获得10能量；CHARGE为每回合可用独立回能指令。\n\
+4) 能量规则：技能需要足够能量才能释放；恢复类效果可回能；每只精灵默认满能量(10)；换宠不重置能量；CHARGE为每回合可用独立回能指令。\n\
 5) 属性克制：单克制2.0，单抵抗0.5；双属性双克制3.0，双属性双抵抗0.25。\n\
 6) 伤害核心：攻击/防御×0.9×威力×克制×本系加成，并受天气/词条影响。\n\
 7) 状态与词条按战报与规则结算（中毒/灼烧/冻结/寄生/萌化/印记/天气等）。\n\
@@ -1527,10 +1675,26 @@ fn build_pet_index(pets: &[PetJsonLite]) -> HashMap<String, PetJsonLite> {
     map
 }
 
+fn apply_pet_battle_patch(pet: &mut BattlePet, patch: Option<&PetBattlePatchEntry>) {
+    let Some(p) = patch else {
+        return;
+    };
+    if let Some(ie) = p.initial_energy {
+        pet.energy = ie;
+    }
+    if p.allow_over_max_energy {
+        pet.energy_cap = p.energy_cap.unwrap_or(99).max(1);
+    } else if let Some(cap) = p.energy_cap {
+        pet.energy_cap = cap.max(1);
+    }
+    pet.energy = pet.energy.clamp(0, pet.energy_cap);
+}
+
 fn build_battle_team(
     raw_team: &[(String, String, Vec<String>)],
     pet_index: &HashMap<String, PetJsonLite>,
     side: &str,
+    pet_patches: &PetBattlePatchTable,
 ) -> Result<Vec<BattlePet>, String> {
     let mut out = Vec::new();
     let mut seed = SystemTime::now()
@@ -1586,7 +1750,7 @@ fn build_battle_team(
             PVP_DEFAULT_INDIVIDUAL_VALUE,
             PVP_DEFAULT_MAGNIFICATION,
         ) + effort.speed;
-        out.push(BattlePet {
+        let mut battle_pet = BattlePet {
             name: pet.name.clone(),
             level: PVP_DEFAULT_LEVEL,
             nature: normalize_nature_name(nature_name),
@@ -1605,7 +1769,8 @@ fn build_battle_team(
             pdef,
             matk,
             mdef,
-            energy: 0,
+            energy: MAX_ENERGY,
+            energy_cap: MAX_ENERGY,
             poison_layers: 0,
             burn_layers: 0,
             freeze_layers: 0,
@@ -1613,12 +1778,14 @@ fn build_battle_team(
             frozen_hp_locked: 0,
             charging_skill: None,
             entry_bonus_power: 0,
-            has_entered_once: false,
             entry_leave_immune: false,
             morph_stage: 0,
             effort,
             skills,
-        });
+        };
+        let patch_key = battle_pet.name.clone();
+        apply_pet_battle_patch(&mut battle_pet, pet_patches.get(&patch_key));
+        out.push(battle_pet);
     }
     Ok(out)
 }
@@ -1987,22 +2154,70 @@ fn apply_field_imprint_from_skill<F: FnMut(&str)>(
     let _ = own_negative_imprint;
 }
 
+fn apply_element_skill_bank_on_entry<F: FnMut(&str)>(
+    side: &str,
+    pet: &mut BattlePet,
+    entry: &PetBattlePatchEntry,
+    elem_banks: &mut ElementSkillBanks,
+    history: &mut String,
+    on_delta: &mut F,
+) {
+    let Some(rule) = &entry.on_entry_per_element_skill_bank else {
+        return;
+    };
+    let count = match rule.element.as_str() {
+        "冰" => elem_banks.ice,
+        "火" => elem_banks.fire,
+        "地" => elem_banks.earth,
+        _ => 0,
+    };
+    if count <= 0 || rule.energy_per_use == 0 {
+        return;
+    }
+    let gain = rule.energy_per_use.saturating_mul(count);
+    pet.energy = (pet.energy + gain).clamp(0, pet.energy_cap);
+    let msg = format!(
+        "{}方 {} 入场：己方{}系技能累计 {} 次，按特性回复 {} 能量（当前{}）。\n",
+        side, pet.name, rule.element, count, gain, pet.energy
+    );
+    history.push_str(&msg);
+    on_delta(&msg);
+    match rule.element.as_str() {
+        "冰" => elem_banks.ice = 0,
+        "火" => elem_banks.fire = 0,
+        "地" => elem_banks.earth = 0,
+        _ => {}
+    }
+}
+
 fn apply_entry_effects<F: FnMut(&str)>(
     side: &str,
     pet: &mut BattlePet,
     negative_imprint: Option<NegativeImprint>,
     positive_imprint: Option<PositiveImprint>,
+    pet_patches: &PetBattlePatchTable,
+    ally_counter_bank: &mut i32,
+    element_banks: &mut ElementSkillBanks,
     history: &mut String,
     on_delta: &mut F,
 ) {
     // 冻结会跨换场保留，入场时先校准可用生命值上限
     recompute_frozen_hp_lock(pet);
-    if !pet.has_entered_once {
-        pet.energy = 10;
-        pet.has_entered_once = true;
-        let msg = format!("{}方 {} 首次出场，获得 10 点能量。\n", side, pet.name);
-        history.push_str(&msg);
-        on_delta(&msg);
+    if let Some(entry) = pet_patches.get(&pet.name) {
+        if let Some(per) = entry.on_entry_energy_per_prior_ally_counter {
+            if *ally_counter_bank > 0 && per != 0 {
+                let gain = per.saturating_mul(*ally_counter_bank);
+                pet.energy = (pet.energy + gain).clamp(0, pet.energy_cap);
+                let msg = format!(
+                    "{}方 {} 入场：己方应对成功累计 {} 次，按特性回复 {} 能量（当前{}）。\n",
+                    side, pet.name, ally_counter_bank, gain, pet.energy
+                );
+                history.push_str(&msg);
+                on_delta(&msg);
+                *ally_counter_bank = 0;
+            }
+        }
+        apply_element_skill_bank_on_entry(side, pet, entry, element_banks, history, on_delta);
     }
     pet.entry_leave_immune = true;
     if let Some(neg) = negative_imprint {
@@ -2044,6 +2259,7 @@ fn apply_entry_effects<F: FnMut(&str)>(
     }
 }
 
+/// 若触发迅捷并成功出手，返回与 `resolve_one_attack` 相同的计数信息。
 fn trigger_swift_on_entry<F: FnMut(&str)>(
     side: &str,
     pet: &mut BattlePet,
@@ -2052,9 +2268,9 @@ fn trigger_swift_on_entry<F: FnMut(&str)>(
     weather: &mut Option<WeatherState>,
     history: &mut String,
     on_delta: &mut F,
-) {
+) -> Option<(String, String)> {
     if opp.cur_hp <= 0 || pet.cur_hp <= 0 {
-        return;
+        return None;
     }
     let first_swift = pet
         .skills
@@ -2065,8 +2281,18 @@ fn trigger_swift_on_entry<F: FnMut(&str)>(
         let msg = format!("{}方 {} 触发迅捷，自动使用 [{}]。\n", side, pet.name, skill_name);
         history.push_str(&msg);
         on_delta(&msg);
-        resolve_one_attack(side, &skill_name, pet, opp, dedication, weather, history, on_delta);
+        return resolve_one_attack(
+            side,
+            &skill_name,
+            pet,
+            opp,
+            dedication,
+            weather,
+            history,
+            on_delta,
+        );
     }
+    None
 }
 
 fn calc_skill_cost(skill: &BattleSkill, weather: Option<&WeatherState>) -> i32 {
@@ -2281,6 +2507,11 @@ fn process_leave_keywords<F: FnMut(&str)>(
     own_negative_imprint: Option<NegativeImprint>,
     own_positive_imprint: Option<PositiveImprint>,
     own_dedication: &DedicationBuff,
+    pet_patches: &PetBattlePatchTable,
+    a_ally_counter_bank: &mut i32,
+    b_ally_counter_bank: &mut i32,
+    a_element_banks: &mut ElementSkillBanks,
+    b_element_banks: &mut ElementSkillBanks,
     history: &mut String,
     on_delta: &mut F,
 ) {
@@ -2327,15 +2558,27 @@ fn process_leave_keywords<F: FnMut(&str)>(
     let msg = format!("{}方因 [{}] 触发离场，上场：{}。\n", side, skill_name, own_team[*own_active].name);
     history.push_str(&msg);
     on_delta(&msg);
+    let ally_bank = if side == "A" {
+        a_ally_counter_bank
+    } else {
+        b_ally_counter_bank
+    };
     apply_entry_effects(
         side,
         &mut own_team[*own_active],
         own_negative_imprint,
         own_positive_imprint,
+        pet_patches,
+        ally_bank,
+        if side == "A" {
+            a_element_banks
+        } else {
+            b_element_banks
+        },
         history,
         on_delta,
     );
-    trigger_swift_on_entry(
+    let swift_tally = trigger_swift_on_entry(
         side,
         &mut own_team[*own_active],
         opp_active_pet,
@@ -2344,6 +2587,14 @@ fn process_leave_keywords<F: FnMut(&str)>(
         history,
         on_delta,
     );
+    if let Some((an, el)) = swift_tally {
+        let banks = if side == "A" {
+            a_element_banks
+        } else {
+            b_element_banks
+        };
+        tally_element_skill_use_for_side(&*own_team, &an, &el, banks, pet_patches);
+    }
 }
 
 fn extract_layers(text: &str, suffix: &str) -> Option<i32> {
@@ -2541,8 +2792,8 @@ fn compact_recent_dynamics(history: &str, keep_rounds: usize, max_lines: usize) 
     }
 }
 
-fn add_energy_capped(current: i32, delta: i32) -> i32 {
-    (current + delta).clamp(0, MAX_ENERGY)
+fn add_energy_clamped(current: i32, delta: i32, cap: i32) -> i32 {
+    (current + delta).clamp(0, cap)
 }
 
 fn decision_to_text(decision: &Decision) -> String {
@@ -2569,7 +2820,7 @@ fn build_initial_team_state(team: &[BattlePet]) -> Vec<PetInitialState> {
             element2: p.element2.clone(),
             ability: p.ability.clone(),
             hp_max: p.hp,
-            energy_max: MAX_ENERGY,
+            energy_max: p.energy_cap,
             speed: p.speed,
             patk: p.patk,
             pdef: p.pdef,
@@ -2717,7 +2968,8 @@ fn apply_positive_imprint_end_turn<F: FnMut(&str)>(
         return;
     };
     if imprint.kind == PositiveImprintKind::Photosynthesis && imprint.layers > 0 && pet.cur_hp > 0 {
-        pet.energy = add_energy_capped(pet.energy, imprint.layers);
+        let cap = pet.energy_cap;
+        pet.energy = add_energy_clamped(pet.energy, imprint.layers, cap);
         let msg = format!(
             "{}方 {} 触发光合({}层)，回复 {} 点能量（当前{}）。\n",
             side, pet.name, imprint.layers, imprint.layers, pet.energy

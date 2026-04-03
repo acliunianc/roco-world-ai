@@ -1,4 +1,5 @@
 mod battle;
+mod pet_battle_patch;
 mod replay;
 
 use battle::AiBattleSetupMode;

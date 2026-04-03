@@ -1,0 +1,100 @@
+{
+  "version": 1,
+  "entries": [
+    {
+      "pet_name": "瞌睡王",
+      "initial_energy": 0,
+      "energy_cap": 10,
+      "on_entry_energy_per_prior_ally_counter": 5,
+      "comment": "慢热型：初始0能；己方应对成功次数×5 入场回能（与白发懒人、动力猿同机制）"
+    },
+    {
+      "pet_name": "白发懒人",
+      "initial_energy": 0,
+      "energy_cap": 10,
+      "on_entry_energy_per_prior_ally_counter": 5,
+      "comment": "慢热型（进化链）"
+    },
+    {
+      "pet_name": "动力猿",
+      "initial_energy": 0,
+      "energy_cap": 10,
+      "on_entry_energy_per_prior_ally_counter": 5,
+      "comment": "慢热型（进化链）"
+    },
+    {
+      "pet_name": "雪豆丁",
+      "initial_energy": 0,
+      "energy_cap": 10,
+      "on_entry_per_element_skill_bank": { "element": "冰", "energy_per_use": 3 },
+      "comment": "己方冰系技能次数×3 入场回能"
+    },
+    {
+      "pet_name": "雪蛮人",
+      "initial_energy": 0,
+      "energy_cap": 10,
+      "on_entry_per_element_skill_bank": { "element": "冰", "energy_per_use": 3 }
+    },
+    {
+      "pet_name": "雪巨人",
+      "initial_energy": 0,
+      "energy_cap": 10,
+      "on_entry_per_element_skill_bank": { "element": "冰", "energy_per_use": 3 }
+    },
+    {
+      "pet_name": "可爱猿",
+      "initial_energy": 0,
+      "energy_cap": 10,
+      "on_entry_per_element_skill_bank": { "element": "火", "energy_per_use": 3 },
+      "comment": "己方火系技能次数×3 入场回能"
+    },
+    {
+      "pet_name": "炽热猿",
+      "initial_energy": 0,
+      "energy_cap": 10,
+      "on_entry_per_element_skill_bank": { "element": "火", "energy_per_use": 3 }
+    },
+    {
+      "pet_name": "火焰猿",
+      "initial_energy": 0,
+      "energy_cap": 10,
+      "on_entry_per_element_skill_bank": { "element": "火", "energy_per_use": 3 }
+    },
+    {
+      "pet_name": "布是石",
+      "initial_energy": 0,
+      "energy_cap": 10,
+      "on_entry_per_element_skill_bank": { "element": "地", "energy_per_use": 3 },
+      "comment": "己方地系技能次数×3 入场回能"
+    },
+    {
+      "pet_name": "布是岩",
+      "initial_energy": 0,
+      "energy_cap": 10,
+      "on_entry_per_element_skill_bank": { "element": "地", "energy_per_use": 3 }
+    },
+    {
+      "pet_name": "布克棱岩",
+      "initial_energy": 0,
+      "energy_cap": 10,
+      "on_entry_per_element_skill_bank": { "element": "地", "energy_per_use": 3 }
+    },
+    {
+      "pet_name": "迷嶂布莱克",
+      "initial_energy": 0,
+      "energy_cap": 10,
+      "on_entry_per_element_skill_bank": {
+        "element": "地",
+        "energy_per_use": 3,
+        "exclude_self_as_attacker": true
+      },
+      "comment": "仅统计「其他精灵」释放的地系技能；原文「获得10能量」未实现"
+    },
+    {
+      "pet_name": "多菇丁",
+      "allow_over_max_energy": true,
+      "energy_cap": 99,
+      "comment": "多人宿舍：可超过10点，软上限99"
+    }
+  ]
+}
